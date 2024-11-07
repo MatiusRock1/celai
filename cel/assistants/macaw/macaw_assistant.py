@@ -1,11 +1,14 @@
 import asyncio
 import json
+import warnings
 from loguru import logger as log
 from cel.assistants.base_assistant import BaseAssistant
+from cel.assistants.macaw.macaw_history_adapter import MacawHistoryAdapter
 from cel.assistants.macaw.macaw_inference_context import MacawNlpInferenceContext
 from cel.assistants.macaw.macaw_nlp import MacawFunctionCall, blend_message, process_insights, process_new_message
 from cel.assistants.macaw.macaw_settings import MacawSettings
 from cel.gateway.model.conversation_lead import ConversationLead
+from cel.gateway.model.message import Message
 from cel.prompt.prompt_template import PromptTemplate
 from cel.stores.history.base_history_provider import BaseHistoryProvider
 from cel.stores.state.base_state_provider import BaseChatStateProvider
@@ -55,6 +58,9 @@ class MacawAssistant(BaseAssistant):
                          name=name,
                          description=description)
         
+        if state is not None:
+            log.warning("MacawAssistant: The 'state' parameter is deprecated and will be removed in a future version.")
+        
         self.state = state or {}
         self.insight_targets = insight_targets
         if settings is None:
@@ -64,10 +70,10 @@ class MacawAssistant(BaseAssistant):
         log.debug(f"Macaw Assistant initialized with settings: {self.settings}")
         
 
-    async def new_message(self, lead: ConversationLead, message: str, local_state: dict = {}):
+    async def new_message(self, message: Message, local_state: dict = {}):
         # create context
         ctx = MacawNlpInferenceContext(
-            lead=lead,
+            lead=message.lead,
             prompt=self.prompt,
             init_state=self.state,
             local_state=local_state,
@@ -87,15 +93,16 @@ class MacawAssistant(BaseAssistant):
                 )
         try:
             # stream this message content from string
-            async for chunk in process_new_message(ctx, message, on_function_call):
+            async for chunk in process_new_message(ctx, message.text, on_function_call):
                 yield chunk
     
         except Exception as e:
-            log.error(f"Macaw Assistant: error processing new message: {e}")
+            # log.error(f"Macaw Assistant: error processing new message: {e}")
+            log.exception(e)
             
         # execute coroutine to get insights in background dont wait for it
         if self.insight_targets:
-            asyncio.create_task(self.do_insights(lead, history_length=self.settings.insights_history_window_length))
+            asyncio.create_task(self.do_insights(message.lead, history_length=self.settings.insights_history_window_length))
         
         
 
@@ -115,32 +122,37 @@ class MacawAssistant(BaseAssistant):
         return await blend_message(ctx, message=text)
     
     async def do_insights(self, lead: ConversationLead, targets: dict = {}, history_length: int = 10):
-        assert isinstance(targets, dict), "targets must be a dictionary"
-        
-        if self.settings.insights_enabled is False:
-            log.warning("Insights are disabled, returning None")
+        try:
+            assert isinstance(targets, dict), "targets must be a dictionary"
+            
+            if self.settings.insights_enabled is False:
+                log.warning("Insights are disabled, returning None")
+                return None
+            
+            log.debug(f"Getting insights for lead: {lead} with targets: {targets}")
+            
+            mix_targets = {**self.insight_targets, **targets}
+            
+            # create context
+            ctx = MacawNlpInferenceContext(
+                lead=lead,
+                prompt=self.prompt,
+                init_state=self.state,
+                local_state={},
+                history_store=self._history_store,
+                state_store=self._state_store,
+                settings=self.settings
+            )
+            
+            insights = await process_insights(ctx, targets=mix_targets)
+            
+            # raise insight event
+            await self.call_event("insights", lead, data=insights)
+            return insights
+        except Exception as e:
+            log.error(f"Error getting insights: {e}")
+            log.exception(e)
             return None
-        
-        log.debug(f"Getting insights for lead: {lead} with targets: {targets}")
-        
-        mix_targets = {**self.insight_targets, **targets}
-        
-        # create context
-        ctx = MacawNlpInferenceContext(
-            lead=lead,
-            prompt=self.prompt,
-            init_state=self.state,
-            local_state={},
-            history_store=self._history_store,
-            state_store=self._state_store,
-            settings=self.settings
-        )
-        
-        insights = await process_insights(ctx, targets=mix_targets)
-        
-        # raise insight event
-        await self.call_event("insights", lead, data=insights)
-        return insights
         
     
     async def process_client_command(self, lead: ConversationLead, command: str, args: list[str]):
@@ -159,12 +171,21 @@ class MacawAssistant(BaseAssistant):
             return
         
         if command == "state":
-            state = self._state_store.get_store(lead.get_session_id())
+            state = await self._state_store.get_store(lead.get_session_id())
             if state is None:
-                yield "No state found"
-                return
-            for k, v in state.items():
-                yield f"{k}: {v}"
+                yield "Stored state: empty"
+            else:
+                yield "Stored state:"
+                for k, v in state.items():
+                    yield f"{k}: {v}"
+                
+            initial_state = self.prompt.initial_state
+            if initial_state:
+                yield "Initial state:"
+                for k, v in initial_state.items():
+                    yield f"{k}: {v}"
+            else:
+                yield "Initial state: empty"
             return
         
         if command == "history":
@@ -206,7 +227,24 @@ class MacawAssistant(BaseAssistant):
             # first 250 chars
             yield self.prompt[:250]
             return
+    
+    
+    async def append_message_to_history(self, lead: ConversationLead, message: str, role: str = "assistant"):
+        assert role in ["assistant", "user", "system"], "role must be one of: assistant, user, system"
+
+        history = MacawHistoryAdapter(self._history_store)
+        
+        from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+        entry = None
+        if role == "assistant":
+            entry = AIMessage(message)
+        elif role == "user":
+            entry = HumanMessage(message)
+        elif role == "system":
+            entry = SystemMessage(message)
             
+        await history.append_to_history(lead, entry)
+        
             
             
     def to_json(self):

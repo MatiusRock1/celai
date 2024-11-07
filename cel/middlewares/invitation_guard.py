@@ -9,6 +9,7 @@ import json
 from dataclasses import asdict, dataclass
 from cel.assistants.base_assistant import BaseAssistant
 from cel.gateway.model.base_connector import BaseConnector
+from cel.gateway.model.conversation_lead import ConversationLead
 from cel.gateway.model.message import Message
 from loguru import logger as log
 
@@ -16,6 +17,7 @@ Redis = aioredis.Redis
 
 # WARNING: DO NOT USE THIS KEY IN PRODUCTION
 DEFUALT_MASTER_KEY = "123456"
+
 
 @dataclass
 class AuthEntry(ABC):
@@ -100,6 +102,7 @@ class InvitationGuardMiddleware(ABC):
         self.telegram_bot_name = telegram_bot_name
         self.whatsapp_phone_number = whatsapp_phone_number
         
+        
     
     # Setup the middleware with the FastAPI application    
     def setup(self, app):
@@ -153,7 +156,7 @@ class InvitationGuardMiddleware(ABC):
             - **name**: The name associated with the invitation (optional)
             """
             code = self.__gen_invite_code()
-            await self.create_invitation(code, request.expires_at, request.name)
+            await self.create_invitation(code, name=request.name, expires_at=request.expires_at)
             return {
                 "message": "Invitation created successfully",
                 "invite_code": code
@@ -170,48 +173,56 @@ class InvitationGuardMiddleware(ABC):
             await self.revoke_invitation(code)
             return {"message": "Invitation revoked successfully"}
 
-
     # MAIN METHOD - Handle the message
     async def __call__(self, message: Message, connector: BaseConnector, assistant: BaseAssistant):
-        assert isinstance(message, Message), "Message must be a Message object"
-        assert isinstance(connector, BaseConnector), "Connector must be a BaseConnector object"
-        
-        if not await self.__handle_invitation_code(message, connector, assistant):
-            return False        
-        
-        entry = await self.get_auth_entry(message.lead.get_session_id())
-        
-        # add last request time in message
-        if entry:
-            assert isinstance(entry, AuthEntry), "Entry must be an AuthEntry object"
+        try:
+            assert isinstance(message, Message), "Message must be a Message object"
+            assert isinstance(connector, BaseConnector), "Connector must be a BaseConnector object"
             
-            if self.allow_only_invited and entry.invite_code is None:
-                log.critical(f"User {message.lead.get_session_id()} is not invited")
+            if not await self.__handle_invitation_code(message, connector, assistant):
+                return False        
+            
+            entry = await self.get_auth_entry(message.lead.get_session_id())
+            
+            # add last request time in message
+            if entry:
+                assert isinstance(entry, AuthEntry), "Entry must be an AuthEntry object"
+                
+                if self.allow_only_invited and entry.invite_code is None:
+                    log.critical(f"User {message.lead.get_session_id()} is not invited")
+                    await connector.send_text_message(message.lead, self.reject_message)
+                    return False
+                
+                time_since_last_request = time.time() - (entry.last_request or 0)
+                message.metadata = message.metadata or {}
+                message.metadata['time_since_last_request'] = time_since_last_request
+                message.metadata['invitation'] = entry.metadata
+                message.lead.metadata = message.lead.metadata or {}
+                message.lead.metadata['time_since_last_request'] = time_since_last_request
+                message.lead.metadata['invitation'] = entry.metadata
+                
+                await self.set_entry(message.lead.get_session_id(), 
+                                    client_cmd_enabled=entry.client_cmd_enabled, 
+                                    metadata=entry.metadata,
+                                    invite_code=entry.invite_code)
+            else:
+                await self.set_entry(message.lead.get_session_id(), 
+                                    client_cmd_enabled=False, 
+                                    metadata={})
                 await connector.send_text_message(message.lead, self.reject_message)
+                await assistant.call_event(self.events.new_conversation, message.lead, message, connector)
+                return False
+                
+            if not await self.__handle_login_command(message, connector, entry, assistant):
                 return False
             
-            time_since_last_request = time.time() - (entry.last_request or 0)
-            message.metadata = message.metadata or {}
-            message.metadata['time_since_last_request'] = time_since_last_request
-            await self.set_entry(message.lead.get_session_id(), 
-                                 client_cmd_enabled=entry.client_cmd_enabled, 
-                                 metadata=message.metadata,
-                                 invite_code=entry.invite_code)
-        else:
-            await self.set_entry(message.lead.get_session_id(), 
-                                 client_cmd_enabled=False, 
-                                 metadata={})
-            await assistant.call_event(self.events.new_conversation, message.lead, message, connector)
+            if not await self.__secure_client_commands(message, connector, entry):
+                return False
             
-        if not await self.__handle_login_command(message, connector, entry, assistant):
+            return True
+        except Exception as e:
+            log.error(f"Error in InvitationGuardMiddleware: {e}")
             return False
-        
-        if not await self.__secure_client_commands(message, connector, entry):
-            return False
-        
-
-        
-        return True
     
     
     # Handle invitation claim
@@ -231,30 +242,30 @@ class InvitationGuardMiddleware(ABC):
     async def __handle_invitation_code(self, message: Message, connector: BaseConnector, assistant: BaseAssistant):
         code = self.__search_invitation_code(message.text)
         if code:
-            entry = await self.get_invitation(code)
+            inv = await self.get_invitation(code)
             
             if code == self.backdoor_invite_code and self.backdoor_invite_code:
                 await self.set_entry(message.lead.get_session_id(), invite_code=code)
                 await connector.send_text_message(message.lead, "Backdoor code accepted")
                 message.text = message.text.replace(code, "")
-                await assistant.call_event(self.events.invitation_accepted, message.lead, message, connector)
+                await assistant.call_event(self.events.invitation_accepted, message.lead, message, connector, data=inv)
                 return True
             
             # Reject cases
             # --------------------------------
-            if entry is None:
+            if inv is None:
                 log.critical(f"Invalid code {code} provided")
                 await connector.send_text_message(message.lead, "Invalid code provided")
                 await assistant.call_event(self.events.rejected_code, message.lead, message, connector)
                 return False
             
-            if entry.expires_at > 0 and time.time() > entry.expires_at:
+            if inv.expires_at > 0 and time.time() > inv.expires_at:
                 log.critical(f"Expired code {code} provided")
                 await connector.send_text_message(message.lead, "Expired code provided")
                 await assistant.call_event(self.events.rejected_code, message.lead, message, connector)
                 return False
             
-            if entry.used:
+            if inv.used:
                 log.critical(f"Code {code} already used")
                 await connector.send_text_message(message.lead, "Code already used")
                 await assistant.call_event(self.events.rejected_code, message.lead, message, connector)
@@ -262,16 +273,15 @@ class InvitationGuardMiddleware(ABC):
 
             # Accept the code
             # --------------------------------
-            await self.set_entry(message.lead.get_session_id(), invite_code=code)
+            await self.set_entry(message.lead.get_session_id(), invite_code=code, metadata=inv.metadata)
             await self.claim_invitation(code)
             await connector.send_text_message(message.lead, "Code accepted")      
             message.text = message.text.replace(code, "")      
-            await assistant.call_event(self.events.invitation_accepted, message.lead, message, connector)
+            await assistant.call_event(self.events.invitation_accepted, message.lead, message, connector, data=inv)
             
             return True
         return True
-            
-    
+                
     # Handle invitations 
     def __gen_invite_code(self):
         # genereate a random code 6 alphanumeric characters, including uppercase and lowercase
@@ -308,11 +318,12 @@ class InvitationGuardMiddleware(ABC):
         url = f"https://wa.me/{self.whatsapp_phone_number}?text={code}"
         return url
     
-    async def create_invitation(self, expires_at: int = 0, name: str = None):
+    async def create_invitation(self, name: str = None, metadata: dict = None, expires_at: int = 0):
         code = self.__gen_invite_code()
         entry = InvitationEntry(invite_code=code, 
                                 created_at=int(time.time()), 
                                 expires_at=expires_at, 
+                                metadata=metadata,
                                 name=name)
         await self.client.hset(self.key_prefix, code, json.dumps(asdict(entry)))
         return entry
@@ -330,16 +341,20 @@ class InvitationGuardMiddleware(ABC):
         return None
     
     async def claim_invitation(self, code: str):
-        entry = await self.get_invitation(code)
-        if entry:
-            entry.used = True
-            await self.client.hset(self.key_prefix, code, json.dumps(asdict(entry)))
-            return entry
+        inv = await self.get_invitation(code)
+        if inv:
+            inv.used = True
+            await self.client.hset(self.key_prefix, code, json.dumps(asdict(inv)))
+            return inv
         return None
     
     async def revoke_invitation(self, code: str):
         await self.client.hdel(self.key_prefix, code)
 
+    async def clear_invitations(self):
+        log.warning(f"Clearing invitations from Redis, all keys with prefix {self.key_prefix} will be deleted")
+        await self.client.delete(self.key_prefix)
+        log.debug("Invitations cleared successfully")
     
     # Handle login/logout commands and secure client commands
     async def __handle_login_command(self, 
@@ -378,8 +393,25 @@ class InvitationGuardMiddleware(ABC):
                 log.critical(f"Client command {text} from {message.lead.get_session_id()} is not allowed")
                 return False
 
+        if text.startswith("/help"):
+            await connector.send_text_message(message.lead, "Available commands:")
+            await connector.send_text_message(message.lead, "/login <master_key> - Login as admin")
+            await connector.send_text_message(message.lead, "/logout - Logout as admin")
+            await connector.send_text_message(message.lead, "/help - Show help")
+            await connector.send_text_message(message.lead, "/reset_auth - Reset session data")
+            await connector.send_text_message(message.lead, "/reset_to_fabric - Reset session data and revoke all invitations")
+            await connector.send_text_message(message.lead, "/invite <name> - Create an invitation")
+            await connector.send_text_message(message.lead, "/authinfo - Show session data")
+        
+        if text.startswith("/reset_to_fabric"):
+            # clear entry for this session
+            await connector.send_text_message(message.lead, "Resetting session data")
+            await self.clear_auth(message.lead.get_session_id())
+            await connector.send_text_message(message.lead, "Revoking all invitations!")
+            await self.clear_invitations()
+            await connector.send_text_message(message.lead, "Now you are uninvited, logged out and all invitations are revoked")
             
-        if text.startswith("/reset all"):
+        if text.startswith("/reset_auth"):
             # clear entry for this session
             await connector.send_text_message(message.lead, "Resetting session data")
             await self.clear_auth(message.lead.get_session_id())
@@ -393,15 +425,7 @@ class InvitationGuardMiddleware(ABC):
             if len(parts) == 2:
                 invitation = await self.create_invitation(name=parts[1])
                 source = message.lead.connector_name
-                qr = None
-                url = None
-                if source == "telegram":
-                    url = self.__gen_telegram_invitation_url(invitation.invite_code)
-                    qr = self.__gen_barcode(url)
-                
-                if source == "whatsapp":
-                    url = self.__gen_whatsapp_invitation_url(invitation.invite_code)
-                    qr = self.__gen_barcode(url)
+                qr, url = await self.get_invitation_assets(message.lead, invitation)
                     
                 if qr and url:
                     await connector.send_image_message(message.lead, qr, filename="qrcode.png")
@@ -415,6 +439,29 @@ class InvitationGuardMiddleware(ABC):
             
         return True
     
+    async def get_invitation_assets(self, lead: ConversationLead, invitation: InvitationEntry):
+        qr = None
+        url = None
+        source = lead.connector_name
+        
+        if source == "telegram":
+            url = self.__gen_telegram_invitation_url(invitation.invite_code)
+            qr = self.__gen_barcode(url)
+        
+        if source == "whatsapp":
+            url = self.__gen_whatsapp_invitation_url(invitation.invite_code)
+            qr = self.__gen_barcode(url)
+        
+        return qr, url
+    
+    async def send_invitation_assets(self, lead: ConversationLead, invitation: InvitationEntry):
+        qr, url = await self.get_invitation_assets(lead, invitation)
+        connector = lead.connector
+        await connector.send_image_message(lead, qr, filename="qrcode.png")
+        await connector.send_text_message(lead, f"Invitation link: {url}")
+        await connector.send_text_message(lead, f"Code: {invitation.invite_code}")
+
+
     # Auth Methods
     async def set_entry(self, 
                         session_id: str, 

@@ -1,20 +1,24 @@
-import asyncio
 import os
+import json
+import asyncio
+import shortuuid
 from loguru import logger as log
 from typing import Any, Callable, Dict
-from aiogram import Bot
+from aiogram import Bot, Dispatcher
 from fastapi import APIRouter, BackgroundTasks
 from loguru import logger as log
-import shortuuid
-import json
-from aiogram.types.input_file import BufferedInputFile, FSInputFile
+
+from aiogram.types.input_file import BufferedInputFile
+from aiogram.types import Message as AiogramMessage
 from cel.comms.utils import async_run
+from cel.connectors.telegram.run_mode import RunMode
 from cel.gateway.model.base_connector import BaseConnector
 from cel.gateway.message_gateway import StreamMode
 from cel.gateway.model.message import Message
 from cel.connectors.telegram.model.telegram_message import TelegramMessage
 from cel.connectors.telegram.model.telegram_lead import TelegramLead
 from cel.gateway.model.message_gateway_context import MessageGatewayContext
+from cel.voice.base_voice_provider import BaseVoiceProvider
 from cel.gateway.model.outgoing import OutgoingMessage,\
                                             OutgoingMessageType,\
                                             OutgoingLinkMessage,\
@@ -23,9 +27,16 @@ from cel.gateway.model.outgoing import OutgoingMessage,\
 
 
 
+
 class TelegramConnector(BaseConnector):
        
-    def __init__(self, token: str = None, stream_mode: StreamMode = StreamMode.SENTENCE, report_errors_to_telegram: bool = False):
+    def __init__(self, 
+                 token: str = None, 
+                 stream_mode: StreamMode = StreamMode.SENTENCE,
+                 voice_provider: BaseVoiceProvider = None,
+                 report_errors_to_telegram: bool = False,
+                 run_mode: str = RunMode.get_default()):
+        
         log.debug("Creating telegram connector")
         self.token = token or os.getenv("TELEGRAM_TOKEN")     
         self.router = APIRouter(prefix="/telegram")
@@ -34,9 +45,10 @@ class TelegramConnector(BaseConnector):
         # generate shortuuid for security token
         self.security_token = shortuuid.uuid()
         self.__create_routes(self.router)
-        
         self.stream_mode = stream_mode
         self.user_queues = {}
+        self.voice_provider = voice_provider
+        self.run_mode = RunMode.get_mode(run_mode)  
         
         
         self.report_errors_to_telegram = report_errors_to_telegram or os.getenv("REPORT_ERRORS_TO_TELEGRAM", False)
@@ -81,7 +93,7 @@ class TelegramConnector(BaseConnector):
                 break  # Sal del bucle y termina la tarea
 
 
-    async def __enqueue_message(self, payload: dict):
+    async def __enqueue_message(self, payload: dict | AiogramMessage):
         chat_id =  str(payload["message"]["from"]["id"])
         log.debug(f"Enqueuing message for chat_id: {chat_id}")
         if chat_id not in self.user_queues:
@@ -91,11 +103,11 @@ class TelegramConnector(BaseConnector):
         await self.user_queues[chat_id].put(payload)
 
 
-    async def __process_message(self, payload: dict):
+    async def __process_message(self, msg: dict | AiogramMessage):
         try:
             log.debug("Received Telegram webhook")
-            log.debug(payload)
-            msg = await TelegramMessage.load_from_message(payload, self.token, connector=self)
+            log.debug(msg)
+            msg = await TelegramMessage.load_from_message(msg, self.token, connector=self)
             
             
             if self.paused:
@@ -113,9 +125,12 @@ class TelegramConnector(BaseConnector):
             log.error(f"Error processing telegram webhook: {e}")
             try:
                 if self.report_errors_to_telegram:
-                    msg =  payload.get("message")
-                    lead = TelegramLead.from_telegram_message(msg, connector=self)
-                    await self.send_text_message(lead, f"Error processing message: {e}")
+                    if isinstance(msg, dict):
+                        msg =  msg.get("message")
+                        lead = TelegramLead.from_telegram_message(msg, connector=self)
+                        await self.send_text_message(lead, f"Error processing message: {e}")
+                    else:
+                        await msg.answer(f"Error processing message: {e}")
             except Exception as e:
                 log.error(f"Error reporting error to telegram: {e}")
                    
@@ -224,7 +239,18 @@ class TelegramConnector(BaseConnector):
 
         await self.bot.send_message(chat_id=lead.chat_id, text=text, reply_markup=reply_markup)
 
-
+    async def send_voice_message(self, lead: TelegramLead, text: str, options: dict = {}, is_partial: bool = False):
+        assert isinstance(lead, TelegramLead), "lead must be an instance of TelegramLead"
+        assert isinstance(text, str), "text must be a string"
+        assert isinstance(self.voice_provider, BaseVoiceProvider), "voice_provider must be an instance of BaseVoiceProvider"
+        
+        if not self.voice_provider:
+            log.critical("Error: Voice provider not set in Telegram Connector")
+        # Convert text to voice
+        voice = self.voice_provider.TTS(text, **options)
+        data = BufferedInputFile(b"".join(voice), filename="voice.ogg")
+        await self.bot.send_voice(chat_id=lead.chat_id, voice=data)
+        
         
     async def send_typing_action(self, lead: TelegramLead):
         """Send typing action to the lead. This will show the typing action in the chat.
@@ -297,7 +323,33 @@ class TelegramConnector(BaseConnector):
         
         webhook_url = f"{context.webhook_url}/telegram/webhook/{self.security_token}"
         log.debug(f"Starting telegram connector with webhook url: {webhook_url}")
-        async_run(self.bot.set_webhook(webhook_url), then=lambda r: log.debug(f'Webhook set: {r}'))
+        if self.run_mode == RunMode.WEBHOOK:
+            log.debug("Starting telegram connector in webhook mode")
+            async_run(self.bot.set_webhook(webhook_url), then=lambda r: log.debug(f'Webhook set: {r}'))
+        else:
+            log.debug("Starting telegram connector in polling mode")
+            
+            asyncio.create_task(self.bot.delete_webhook())
+            dp = Dispatcher()
+            
+            @dp.message()
+            async def message_handler(message: AiogramMessage) -> None:
+                try:
+                    message_dict=json.loads(message.model_dump_json(exclude_none=True, by_alias=True))
+                    await self.__enqueue_message({"message": message_dict})
+                except Exception as e:
+                    log.error(f"Error processing message: {e}")
+                    if self.report_errors_to_telegram:
+                        await message.answer("Error processing message:" + str(e))
+                    
+            async def run_pulling() -> None:
+                await self.bot.delete_webhook()
+                # And the run events dispatching
+                await dp.start_polling(self.bot)
+                    
+            task = asyncio.create_task(run_pulling())
+            log.debug("Telegram Polling started")
+                              
     
     def shutdown(self, context: MessageGatewayContext):
         log.debug("Shutting down telegram connector")

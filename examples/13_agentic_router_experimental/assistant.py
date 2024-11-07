@@ -1,6 +1,6 @@
 """
-Smoothy Inc Clerk Assistant with RAG
--------------------------------------
+Cel.ai Example: Agentic Router Experimental
+--------------------------------------------------
 
 This is a simple example of an AI Assistant implemented using the Cel.ai framework.
 It serves as a basic demonstration of how to get started with Cel.ai for creating intelligent assistants.
@@ -45,9 +45,10 @@ sys.path.append(str(path.parents[1]))
 from cel.connectors.telegram import TelegramConnector
 from cel.gateway.message_gateway import MessageGateway, StreamMode
 from cel.message_enhancers.smart_message_enhancer_openai import SmartMessageEnhancerOpenAI
+from cel.assistants.router.agentic_router import AgenticRouter 
+from cel.assistants.router.logic_router import LogicRouter
 from balance_agent import build_balance_agent
 from transfer_agent import build_transfer_agent
-from cel.assistants.router.agentic_router import AgenticRouter 
 
 
 
@@ -57,6 +58,9 @@ from cel.assistants.router.agentic_router import AgenticRouter
 # It is used to create a multi-assistant system
 # The Agentic Router requires a list of assistants to route messages to
 assistants = [build_balance_agent(), build_transfer_agent()]
+
+
+
 
 # Instantiate the Agentic Router
 ast = AgenticRouter(assistants=assistants)
@@ -74,6 +78,7 @@ conn = TelegramConnector(
     token=os.environ.get("TELEGRAM_TOKEN"), 
     stream_mode=StreamMode.FULL
 )
+
 # Register the connector with the gateway
 gateway.register_connector(conn)
 
