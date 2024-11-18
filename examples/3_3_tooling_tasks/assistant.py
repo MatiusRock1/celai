@@ -1,6 +1,6 @@
 """
-Celai 101 Tooling Example: Crypto prices
-------------------------------------------
+Celai 101 Tooling Example: TODO Task Manager
+-----------------------------------------------
 
 This is a simple example of an AI Assistant implemented using the Cel.ai framework.
 It serves as a basic demonstration of how to get started with Cel.ai for creating intelligent assistants.
@@ -23,6 +23,7 @@ Note:
 Please ensure you have the Cel.ai framework installed in your Python environment prior to running this script.
 """
 # LOAD ENV VARIABLES
+import json
 import os
 import time
 from urllib import request
@@ -53,6 +54,7 @@ from cel.gateway.model.conversation_lead import ConversationLead
 from cel.assistants.function_context import FunctionContext
 from cel.assistants.common import Param
 from datetime import datetime
+from task_manager import TaskManager
 
 
 def date():
@@ -63,7 +65,7 @@ def get_customer_name(lead: ConversationLead):
 
 
 # Setup prompt
-prompt = """Your name is {assistant_name}. I can help you with the latest crypto prices.
+prompt = """Your name is {assistant_name}. I can help you with task management. 
 Today is {date}. 
 Customer's name is {customer_name}, address him by his name.
 """
@@ -71,7 +73,7 @@ Customer's name is {customer_name}, address him by his name.
 
 prompt_template = PromptTemplate(prompt, initial_state={
         # Assistant name
-        "assistant_name": "CryptoBot",
+        "assistant_name": "Tasky",
         # Today full date and time
         "date": date,
         # Get the customer name from the lead
@@ -91,24 +93,48 @@ async def handle_message(session, ctx: RequestContext):
 
 
 # --------------------------------------------------------------------
-@ast.function('get_crypto_price', 'Get the latest price of a cryptocurrency', params=[
-    Param('asset', 'string', 'The cryptocurrency asset to get the price for. Example: BTC, ETH, DOGE', required=True)
+@ast.function('register_tasks', 'Register a new task', params=[
+    Param('task', 'string', 'The task to be registered', required=True),
 ])
-async def handle_get_crypto_price(session, params, ctx: FunctionContext):    
-    log.debug(f"Got get_crypto_price command with params: {params}")
-    asset = params['asset']
+async def handle_register_tasks(session, params, ctx: FunctionContext):    
+    log.debug(f"Got register_tasks command with params: {params}")
+    task = params.get("task")    
+    assert task, "Task cannot be empty"
     
-    try:
-        #  Request to Coinbase API
-        from util import get_crypto_price
-        price = get_crypto_price(asset)
-        return ctx.response_text(f"The current price of {asset} is ${price}")
-    except Exception as e:
-        log.error(f"Error getting crypto price: {e}")
-        ctx.response_text(f"Error. Please go to https://coinbase.com/ for the latest price of {asset}")
+    manager = TaskManager(ctx.state_manager())    
+    await manager.add_task(task)
 
+        
+    return ctx.response_text(f"Done")
+    
 # --------------------------------------------------------------------
 
+# --------------------------------------------------------------------
+@ast.function('list_tasks', 'List all registered tasks', params=[])
+async def handle_list_tasks(session, params, ctx: FunctionContext):    
+    log.debug(f"Got list_tasks command")
+    
+    manager = TaskManager(ctx.state_manager())
+    tasks = await manager.get_tasks()
+    
+    return ctx.response_text(f"Tasks: {json.dumps(tasks)}")
+# --------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------
+@ast.function('complete_task', 'Complete a task', params=[
+    Param('task', 'string', 'The task to be completed', required=True),
+])
+async def handle_complete_task(session, params, ctx: FunctionContext):    
+    log.debug(f"Got complete_task command with params: {params}")
+    task = params.get("task")    
+    assert task, "Task cannot be empty"
+    
+    manager = TaskManager(ctx.state_manager())    
+    await manager.remove_task(task)
+
+    return ctx.response_text(f"Done")
+# --------------------------------------------------------------------
 
 
 # Create the Message Gateway - This component is the core of the assistant

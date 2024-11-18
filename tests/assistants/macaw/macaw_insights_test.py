@@ -1,16 +1,18 @@
 import pytest
+import os
 from cel.assistants.macaw.macaw_assistant import MacawAssistant
 from cel.assistants.macaw.macaw_history_adapter import MacawHistoryAdapter
 from cel.assistants.request_context import RequestContext
 from cel.gateway.model.conversation_lead import ConversationLead
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-
+from cel.stores.history.history_inmemory_provider import InMemoryHistoryProvider
 
 # load envs
 from dotenv import load_dotenv
-
-from cel.stores.history.history_inmemory_provider import InMemoryHistoryProvider
 load_dotenv()
+
+
+is_openai_available = 'OPENAI_API_KEY' not in os.environ
 
 
 
@@ -19,10 +21,8 @@ def lead():
     lead = ConversationLead()
     return lead
 
-
-
-    
 @pytest.mark.asyncio
+@pytest.mark.skipif(is_openai_available, reason="Disable in Github Actions")
 async def test_insight_with_events(lead: ConversationLead):
 
     insight_targets = {

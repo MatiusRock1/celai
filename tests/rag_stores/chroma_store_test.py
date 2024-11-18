@@ -1,8 +1,11 @@
+import os
 import pytest
 from cel.rag.text2vec.cached_openai import CachedOpenAIEmbedding
 import dotenv
 
 dotenv.load_dotenv()
+
+is_openai_available = 'OPENAI_API_KEY' not in os.environ
 
 
 texts=[
@@ -19,11 +22,7 @@ def client():
 
 
 
-# def test_do(client):
-#     for i in range(5):
-#         client.text2vec(f'test:{i}')
-#     assert 1==1
-    
+@pytest.mark.skipif(is_openai_available, reason="Disable in Github Actions")
 def test_do2(client: CachedOpenAIEmbedding):
     # test with texts
     res = client.texts2vec(texts)

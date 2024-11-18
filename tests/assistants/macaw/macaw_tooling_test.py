@@ -1,12 +1,14 @@
 import pytest
-
+import os
 from cel.assistants.common import FunctionDefinition, Param
 from cel.assistants.macaw.macaw_utils import map_function_to_tool_message
 
 
+is_github_actions = 'OPENAI_API_KEY' not in os.environ
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(is_github_actions, reason="Disable in Github Actions")
 async def test_map_function_to_tool_message():
     
 
